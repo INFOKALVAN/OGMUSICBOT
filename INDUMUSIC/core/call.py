@@ -435,22 +435,6 @@ class Call:
                 await client.leave_call(chat_id)
             except Exception:
                 pass
-    async def start(self) -> None:
-        """Start all configured PyTgCalls assistant clients."""
-        LOGGER(__name__).info("Starting PyTgCalls Clients...")
-
-        assistants = [
-            self.one if config.STRING1 else None,
-            self.two if config.STRING2 else None,
-            self.three if config.STRING3 else None,
-            self.four if config.STRING4 else None,
-            self.five if config.STRING5 else None,
-        ]
-
-        for assistant in assistants:
-            if assistant is not None:
-                await assistant.start()
-
     @capture_internal_err
     async def ping(self) -> str:
         pings = []
