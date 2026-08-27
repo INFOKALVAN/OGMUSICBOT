@@ -1,0 +1,238 @@
+import os
+import re
+from pyrogram import filters
+from pyrogram.enums import ChatAction
+from pyrogram.types import (
+    InputMediaAudio,
+    InputMediaVideo,
+    Message,
+)
+
+from INDUMUSIC import app, YouTube
+from INDUMUSIC.utils.colored_buttons import styled_button, buttons_to_inline_markup
+from config import (
+    BANNED_USERS,
+    SONG_DOWNLOAD_DURATION,
+    SONG_DOWNLOAD_DURATION_LIMIT,
+)
+from INDUMUSIC.utils.decorators.language import language, languageCB
+from INDUMUSIC.utils.errors import capture_err, capture_callback_err
+from INDUMUSIC.utils.formatters import convert_bytes, time_to_seconds
+from INDUMUSIC.utils.inline.song import song_markup
+
+SONG_COMMAND = ["song"]
+
+
+class InlineKeyboardBuilder(list):
+    def row(self, *btns):
+        self.append(list(btns))
+
+
+# ───────────────────────────── COMMANDS ───────────────────────────── #
+@app.on_message(filters.command(SONG_COMMAND) & filters.group & ~BANNED_USERS)
+@capture_err
+@language
+async def song_command_group(client, message: Message, lang):
+    await send_message_colored(
+        chat_id=message.chat.id,
+        text=lang["song_1"],
+        reply_markup=[[styled_button(lang["SG_B_1"], url=f"https://t.me/{app.username}?start=song", style="primary")]],
+    )
+
+
+@app.on_message(filters.command(SONG_COMMAND) & filters.private & ~BANNED_USERS)
+@capture_err
+@language
+async def song_command_private(client, message: Message, lang):
+    await message.delete()
+    mystic = await message.reply_text(lang["play_1"])
+
+    url = await YouTube.url(message)
+    query = url or (message.text.split(None, 1)[1] if len(message.command) > 1 else None)
+    if not query:
+        return await mystic.edit_text(lang["song_2"])
+
+    if url and not await YouTube.exists(url):
+        return await mystic.edit_text(lang["song_5"])
+
+    try:
+        title, dur_min, dur_sec, thumb, vidid = await YouTube.details(query)
+    except Exception:
+        return await mystic.edit_text(lang["play_3"])
+
+    if not dur_min:
+        return await mystic.edit_text(lang["song_3"])
+    if int(dur_sec) > SONG_DOWNLOAD_DURATION_LIMIT:
+        return await mystic.edit_text(lang["play_4"].format(SONG_DOWNLOAD_DURATION, dur_min))
+
+    await mystic.delete()
+    await send_photo_colored(
+        chat_id=message.chat.id,
+        photo=thumb,
+        caption=lang["song_4"].format(title),
+        reply_markup=song_markup(lang, vidid),
+    )
+
+
+# ───────────────────────────── CALLBACKS ───────────────────────────── #
+@app.on_callback_query(filters.regex(r"song_back") & ~BANNED_USERS)
+@capture_callback_err
+@languageCB
+async def songs_back_helper(client, cq, lang):
+    _ignored, req = cq.data.split(None, 1)
+    stype, vidid = req.split("|")
+    await edit_reply_markup_colored(
+        chat_id=cq.message.chat.id,
+        message_id=cq.message.id,
+        reply_markup=song_markup(lang, vidid),
+    )
+
+
+@app.on_callback_query(filters.regex(r"song_helper") & ~BANNED_USERS)
+@capture_callback_err
+@languageCB
+async def song_helper_cb(client, cq, lang):
+    _ignored, req = cq.data.split(None, 1)
+    stype, vidid = req.split("|")
+
+    try:
+        await cq.answer(lang["song_6"], show_alert=True)
+    except Exception:
+        pass
+
+    try:
+        formats, _ = await YouTube.formats(vidid)
+    except Exception:
+        return await cq.edit_message_text(lang["song_7"])
+
+    kb = InlineKeyboardBuilder()
+    seen = set()
+
+    if stype == "audio":
+        for f in formats:
+            if "audio" not in f.get("format", "") or not f.get("filesize"):
+                continue
+            label = (f.get("format_note") or "").title() or "Audio"
+            if label in seen:
+                continue
+            seen.add(label)
+            kb.row(
+                styled_button(
+                    text=f"{label} • {convert_bytes(f['filesize'])}",
+                    callback_data=f"song_download {stype}|{f['format_id']}|{vidid}",
+                    style="success",
+                )
+            )
+    else:
+        allowed = {160, 133, 134, 135, 136, 137, 298, 299, 264, 304, 266}
+        for f in formats:
+            try:
+                fmt_id = int(f.get("format_id", 0))
+            except Exception:
+                continue
+            if not f.get("filesize") or fmt_id not in allowed:
+                continue
+            note = (f.get("format_note") or "").strip()
+            res = note or f.get("format", "").split("-")[-1].strip() or str(fmt_id)
+            kb.row(
+                styled_button(
+                    text=f"{res} • {convert_bytes(f['filesize'])}",
+                    callback_data=f"song_download {stype}|{f['format_id']}|{vidid}",
+                    style="success",
+                )
+            )
+
+    kb.row(
+        styled_button(lang["BACK_BUTTON"], callback_data=f"song_back {stype}|{vidid}", style="primary"),
+        styled_button(lang["CLOSE_BUTTON"], callback_data="close", style="danger"),
+    )
+    await edit_reply_markup_colored(chat_id=cq.message.chat.id, message_id=cq.message.id, reply_markup=kb)
+
+
+@app.on_callback_query(filters.regex(r"song_download") & ~BANNED_USERS)
+@capture_callback_err
+@languageCB
+async def song_download_cb(client, cq, lang):
+    try:
+        await cq.answer("Downloading…")
+    except Exception:
+        pass
+
+    _ignored, req = cq.data.split(None, 1)
+    stype, fmt_id, vidid = req.split("|")
+    yturl = f"https://www.youtube.com/watch?v={vidid}"
+
+    mystic = await cq.edit_message_text(lang["song_8"])
+
+    file_path = None
+    try:
+        info, _ = await YouTube.track(yturl)
+        raw_title = info.get("title") or "Song"
+        title = re.sub(r"\s+", " ", re.sub(r"[^\w\s\-\.\(\)\[\]]+", " ", raw_title)).strip()[:200]
+        duration_sec = time_to_seconds(info.get("duration_min")) if info.get("duration_min") else None
+
+        # Retry logic for YouTube download
+        max_retries = 3
+        download_success = False
+
+        if stype == "audio":
+            for attempt in range(max_retries):
+                try:
+                    file_path, _ = await YouTube.download(
+                        yturl, mystic, songaudio=True, format_id=fmt_id, title=title
+                    )
+                    if file_path:
+                        download_success = True
+                        break
+                except Exception:
+                    if attempt < max_retries - 1:
+                        continue
+
+            if not download_success or not file_path:
+                raise RuntimeError("no audio file")
+            await app.send_chat_action(cq.message.chat.id, ChatAction.UPLOAD_AUDIO)
+            await cq.edit_message_media(
+                InputMediaAudio(
+                    media=file_path,
+                    caption=title,
+                    title=title,
+                    performer=info.get("uploader"),
+                )
+            )
+        else:
+            for attempt in range(max_retries):
+                try:
+                    file_path, _ = await YouTube.download(
+                        yturl, mystic, songvideo=True, format_id=fmt_id, title=title
+                    )
+                    if file_path:
+                        download_success = True
+                        break
+                except Exception:
+                    if attempt < max_retries - 1:
+                        continue
+
+            if not download_success or not file_path:
+                raise RuntimeError("no video file")
+            await app.send_chat_action(cq.message.chat.id, ChatAction.UPLOAD_VIDEO)
+            w = getattr(getattr(cq.message, "photo", None), "width", None)
+            h = getattr(getattr(cq.message, "photo", None), "height", None)
+            await cq.edit_message_media(
+                InputMediaVideo(
+                    media=file_path,
+                    duration=duration_sec,
+                    width=w,
+                    height=h,
+                    caption=title,
+                    supports_streaming=True,
+                )
+            )
+
+    except Exception:
+        await mystic.edit_text(lang["song_10"])
+    finally:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
