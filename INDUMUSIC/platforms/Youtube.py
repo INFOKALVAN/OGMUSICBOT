@@ -838,132 +838,81 @@ class YouTubeAPI:
         format_id: Union[bool, str, None] = None,
         title: Union[bool, str, None] = None,
     ) -> Union[Tuple[str, Optional[bool]], Tuple[None, None]]:
-        """Download a YouTube track using the bot's shared downloader.
-
-        Important: never rename an m4a/webm file to .mp3/.mp4.  The previous
-        implementation did that in a few fallback paths, which produced files
-        whose extension/container did not match and caused stream() to report
-        ``play_14`` (failed to fetch track details).
-        """
         link = self._prepare_link(link, videoid)
-        video_id = self._extract_video_id(link)
-        if not video_id:
-            return None, None
+        video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
+        
+        extension = ".webm" if not video else ".mp4"
+        common_file_path = os.path.join("downloads", f"{video_id}{extension}")
+        
+        if os.path.exists(common_file_path) and os.path.getsize(common_file_path) > 10240:
+            _module_logger.info("✅ Local cache")
+            return common_file_path, True
 
-        os.makedirs("downloads", exist_ok=True)
-
-        # 1) Use the project's downloader. It already handles cookies,
-        # yt-dlp, API fallback, de-duplication and the configured download dir.
-        try:
-            if video or songvideo:
-                path = await yt_dlp_download(link, type="video")
+        if songvideo or video:
+            try:
+                downloaded_file = await download_video(link)
+                if downloaded_file:
+                    _module_logger.info("✅ Video downloaded successfully")
+                    if downloaded_file != common_file_path and downloaded_file.endswith('.mp4'):
+                        try:
+                            shutil.move(downloaded_file, common_file_path)
+                            return common_file_path, True
+                        except Exception:
+                            return downloaded_file, True
+                    return downloaded_file, True
+            except Exception as e:
+                _module_logger.info(f"❌ Video download error: {str(e)}")
+            
+            status, stream_url = await self.video(link)
+            if status == 1:
+                _module_logger.info("✅ Video stream")
+                return stream_url, None
             else:
-                path = await yt_dlp_download(link, type="audio")
+                return None, None
 
-            if path and self._valid_media_file(path, video=bool(video or songvideo)):
-                _module_logger.info("✅ YouTube download success: %s", path)
-                return path, True
-        except Exception as exc:
-            _module_logger.warning("YouTube shared downloader failed: %s", exc)
+        else:
+            # ── LIGHTNING FAST: Race all download methods concurrently ──
+            async def _try_primary():
+                return await download_audio(link)
 
-        # 2) Direct yt-dlp fallback. This is deliberately a real download,
-        # not an API response saved blindly to an audio/video extension.
-        try:
-            await _check_rate_limit_async()
-            cookie_args = _cookies_args()
-            output_template = os.path.join("downloads", f"{video_id}.%(ext)s")
+            async def _try_ytdlp():
+                return await yt_dlp_download(link, type="audio")
 
-            if video or songvideo:
-                formats = [
-                    "best[height<=720][width<=1280]/best[ext=mp4]/best",
-                    "best[ext=mp4]/best",
-                    "best",
-                ]
-            else:
-                formats = [
-                    "bestaudio/best",
-                    "best[ext=m4a]/best",
-                    "best",
-                ]
+            async def _try_concurrent():
+                return await download_audio_concurrent(link)
 
-            for fmt in formats:
+            # Race: first successful result wins
+            tasks = [
+                asyncio.create_task(_try_primary()),
+                asyncio.create_task(_try_ytdlp()),
+                asyncio.create_task(_try_concurrent()),
+            ]
+
+            audio_result = None
+            for coro in asyncio.as_completed(tasks):
                 try:
-                    args = [
-                        "yt-dlp",
-                        *cookie_args,
-                        "--no-warnings",
-                        "--no-playlist",
-                        "--geo-bypass",
-                        "--force-ipv4",
-                        "--retries", "3",
-                        "--fragment-retries", "3",
-                        "-f", fmt,
-                        "-o", output_template,
-                        link,
-                    ]
-                    _, stderr = await _exec_proc(*args)
-                    candidates = []
-                    for name in os.listdir("downloads"):
-                        if name.startswith(f"{video_id}.") and not name.endswith(".part"):
-                            candidates.append(os.path.join("downloads", name))
-                    candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-                    for candidate in candidates:
-                        if self._valid_media_file(candidate, video=bool(video or songvideo)):
-                            _module_logger.info("✅ YouTube yt-dlp fallback success: %s", candidate)
-                            return candidate, True
-                    if stderr:
-                        _module_logger.warning(
-                            "yt-dlp format failed for %s: %s",
-                            video_id,
-                            stderr.decode("utf-8", errors="ignore")[-500:],
-                        )
-                except Exception as exc:
-                    _module_logger.warning("yt-dlp fallback error: %s", exc)
+                    result = await coro
+                    if result and os.path.exists(result) and os.path.getsize(result) > 10240:
+                        audio_result = result
+                        # Cancel remaining tasks
+                        for t in tasks:
+                            t.cancel()
+                        break
+                except Exception:
+                    continue
 
-        except Exception as exc:
-            _module_logger.error("YouTube download fallback failed: %s", exc)
+            if audio_result:
+                _module_logger.info("✅ Audio downloaded (race winner)")
+                if audio_result != common_file_path:
+                    try:
+                        shutil.move(audio_result, common_file_path)
+                        return common_file_path, True
+                    except Exception:
+                        return audio_result, True
+                return audio_result, True
 
-        _module_logger.error("❌ YouTube download failed for %s", video_id)
-        return None, None
-
-    @staticmethod
-    def _extract_video_id(link: str) -> str:
-        """Extract a YouTube video id without accidentally keeping query data."""
-        try:
-            parsed = urlparse(link)
-            host = parsed.netloc.lower()
-            if "youtu.be" in host:
-                return parsed.path.strip("/").split("/")[0]
-            if "youtube.com" in host:
-                if parsed.query:
-                    from urllib.parse import parse_qs
-                    value = parse_qs(parsed.query).get("v", [None])[0]
-                    if value:
-                        return value
-                for marker in ("/shorts/", "/live/", "/embed/"):
-                    if marker in parsed.path:
-                        return parsed.path.split(marker, 1)[1].split("/", 1)[0]
-                return parsed.path.rstrip("/").split("/")[-1]
-            return link.split("v=")[-1].split("&")[0].split("?")[0].strip()
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _valid_media_file(path: str, *, video: bool = False) -> bool:
-        """Reject HTML/JSON error pages masquerading as media files."""
-        try:
-            if not path or not os.path.isfile(path) or os.path.getsize(path) < 10 * 1024:
-                return False
-            with open(path, "rb") as fh:
-                head = fh.read(512).lower()
-            if head.startswith((b"<!doctype html", b"<html", b"{", b"[")):
-                return False
-            ext = os.path.splitext(path)[1].lower()
-            if video:
-                return ext in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
-            return ext in {".mp3", ".m4a", ".webm", ".opus", ".ogg", ".wav", ".aac"}
-        except Exception:
-            return False
+            _module_logger.info("❌ All audio download methods failed")
+            return None, None
 
 YouTube = YouTubeAPI()
 
