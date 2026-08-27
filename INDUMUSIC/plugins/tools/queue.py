@@ -34,7 +34,10 @@ def get_duration(playing):
     file_path = playing[0]["file"]
     if "index_" in file_path or "live_" in file_path:
         return "Unknown"
-    duration_seconds = int(playing[0]["seconds"])
+    try:
+        duration_seconds = int(playing[0].get("seconds", 0))
+    except (TypeError, ValueError, AttributeError):
+        return "Unknown"
     if duration_seconds == 0:
         return "Unknown"
     else:
@@ -113,7 +116,7 @@ async def get_queue(client, message: Message, _):
         mystic = await message.reply_photo(IMAGE, caption=cap, reply_markup=buttons_to_inline_markup(upl))
     if DUR != "Unknown":
         try:
-            while db[chat_id][0]["vidid"] == videoid:
+            while chat_id in db and db.get(chat_id) and db[chat_id][0].get("vidid") == videoid:
                 await asyncio.sleep(5)
                 if await is_active_chat(chat_id):
                     if basic[videoid]:
@@ -164,8 +167,14 @@ async def quite_timer(client, CallbackQuery: CallbackQuery):
 @languageCB
 async def queued_tracks(client, CallbackQuery: CallbackQuery, _):
     callback_data = CallbackQuery.data.strip()
-    callback_request = callback_data.split(None, 1)[1]
-    what, videoid = callback_request.split("|")
+    parts = callback_data.split(None, 1)
+    if len(parts) < 2:
+        return await CallbackQuery.answer("Invalid callback.", show_alert=True)
+    callback_request = parts[1]
+    try:
+        what, videoid = callback_request.split("|", 1)
+    except ValueError:
+        return await CallbackQuery.answer("Invalid queue request.", show_alert=True)
     try:
         chat_id, channel = await get_channeplayCB(_, what, CallbackQuery)
     except:
@@ -213,7 +222,10 @@ async def queued_tracks(client, CallbackQuery: CallbackQuery, _):
 @languageCB
 async def queue_back(client, CallbackQuery: CallbackQuery, _):
     callback_data = CallbackQuery.data.strip()
-    cplay = callback_data.split(None, 1)[1]
+    parts = callback_data.split(None, 1)
+    if len(parts) < 2:
+        return await CallbackQuery.answer("Invalid callback.", show_alert=True)
+    cplay = parts[1].strip()
     try:
         chat_id, channel = await get_channeplayCB(_, cplay, CallbackQuery)
     except:
@@ -274,7 +286,7 @@ async def queue_back(client, CallbackQuery: CallbackQuery, _):
         mystic = await CallbackQuery.edit_message_media(media=InputMediaPhoto(media=IMAGE, caption=cap), reply_markup=buttons_to_inline_markup(upl))
     if DUR != "Unknown":
         try:
-            while db[chat_id][0]["vidid"] == videoid:
+            while chat_id in db and db.get(chat_id) and db[chat_id][0].get("vidid") == videoid:
                 await asyncio.sleep(5)
                 if await is_active_chat(chat_id):
                     if basic[videoid]:
